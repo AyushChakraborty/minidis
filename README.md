@@ -1,3 +1,3 @@
-Building a small redis, will be fun!
+Building a small redis.
 
-following build your own redis (good read!)
+Inspiration: build your own redis
