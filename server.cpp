@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <vector>
+#include <map>
 #include "io_utils.h"
 
 static void die(const char *msg) {
@@ -143,12 +144,109 @@ static void handle_write(Conn *conn) {
 
     //remove written from ongoing
    buf_consume(&conn->outgoing_status, (size_t)rv);
-
+   size_t remaining = conn->outgoing_status.data_end - conn->outgoing_status.data_begin;
     //if all data written, update the readiness intention
-    if (data_len == 0) {
+    if (remaining == 0) {
         conn->want_read = true;
         conn->want_write = false;
     }
+}
+
+//here is the req pattern:
+// | nstr | len | str1 | len | str2 | .....
+// where nstr actually contains the net size of this req
+// and each req/cmd is a sequence of strings specified by the
+// len str pairs
+
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out) {
+    if (cur + 4 > end) {
+        return false;
+    }
+    memcpy(&out, cur, 4);
+    cur += 4;
+    return true;
+}
+
+static bool read_str(const uint8_t *&cur, const uint8_t *end, uint32_t &len, std::string &out) {
+    if (cur + len > end) {
+        return false;
+    }
+    out.assign(cur, cur+len);
+    cur += len;
+    return true;
+}
+
+const size_t max_args = 200 * 1000;
+
+static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out) {
+    const uint8_t *end = data + size;
+    uint32_t nstr = 0;
+    if (!read_u32(data, end, nstr)) {
+        return -1;
+    }
+    if (nstr > max_args) {
+        return -1;
+    }
+    
+    while (out.size() < nstr) {
+        uint32_t len = 0;
+        if (!read_u32(data, end, len)) {
+            return -1;
+        }
+        out.push_back(std::string());
+        if (!read_str(data, end, len, out.back())) {
+            return -1;
+        }
+    }
+    if (data != end) {
+        return -1;   //garbage trailing values present
+    }
+    return 0;
+}
+
+//format of response
+// | status | data ... |
+enum {
+    RES_OK = 0,
+    RES_ERR = 1, //error
+    RES_NX = 2,    //key not found
+};
+
+struct Response {
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
+};
+
+//kv store
+static std::map<std::string, std::string> store;
+
+static void do_request(std::vector<std::string> &cmd, Response &out) {
+    if (cmd.size() == 2 && cmd[0] == "get") {
+        auto it = store.find(cmd[1]);
+        if (it == store.end()) {
+            out.status = RES_NX;
+            return;
+        }
+        const std::string &val = it->second;
+        out.data.assign(val.begin(), val.end());
+    }else if (cmd.size() == 3 && cmd[0] == "set") {
+        store[cmd[1]].swap(cmd[2]);  //swaps ptrs, that way
+        //even if cmd is dropped, which is will be, the ptr
+        //to the value is safe and would be possessed by store[cmd[1]], and 
+        //is guaranteed to not be a dangling ptr   
+    }else if (cmd.size() == 2 && cmd[0] == "del") {
+        store.erase(cmd[1]);
+    }else {
+        //unrecognised command
+        out.status = RES_ERR;
+    }
+}
+
+static void make_response(const Response &resp, struct Buffer *out_status, std::vector<uint8_t> &out) {
+    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
+    buf_append(&out, out_status, (const uint8_t *)&resp_len, 4);
+    buf_append(&out, out_status, (const uint8_t *)&resp.status, 4);
+    buf_append(&out, out_status, resp.data.data(), resp.data.size());
 }
 
 static bool try_one_request(Conn *conn) {
@@ -173,12 +271,18 @@ static bool try_one_request(Conn *conn) {
 
     const uint8_t *req = &conn->incoming[4];
 
-    //dummy application logic here
-    printf("client says: len:%d data:%.*s\n", len, len < 100 ? len : 100, req);
-
-    //generate echo response
-    buf_append(&conn->outgoing, &conn->outgoing_status, (const uint8_t *)&len, 4);
-    buf_append(&conn->outgoing, &conn->outgoing_status, req, len);
+   //application logic here
+   std::vector<std::string> cmd;
+   if (parse_req(req, len, cmd) < 0) {
+       msg("bad request");
+       conn->want_close = true;
+       return false;
+   }
+   
+   Response resp;
+   do_request(cmd, resp);
+   make_response(resp, &conn->outgoing_status, conn->outgoing);
+   
 
     //remove the req message
     buf_consume(&conn->incoming_status, 4 + len);
@@ -188,7 +292,6 @@ static bool try_one_request(Conn *conn) {
 
 static void handle_read(Conn *conn) {
     size_t data_len_incoming = conn->incoming_status.data_end - conn->incoming_status.data_begin;
-    size_t data_len_outgoing = conn->outgoing_status.data_end - conn->outgoing_status.data_begin;
 
     uint8_t buf[buf_size];
     ssize_t rv = read(conn->fd, buf, sizeof(buf));
@@ -217,9 +320,11 @@ static void handle_read(Conn *conn) {
 
     //parse reqs and generate responses
     while (try_one_request(conn)) {}     //in a while loop to handle pipelined reqs from client
+    
+    size_t curr_outgoing_len = conn->outgoing_status.data_end - conn->outgoing_status.data_begin;
 
     //update readiness intention
-    if (data_len_outgoing > 0) {    //has a response
+    if (curr_outgoing_len > 0) {    //has a response
         conn->want_read = false;
         conn->want_write = true;
         //try to write now without waiting for the next iteration
