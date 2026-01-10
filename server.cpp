@@ -17,7 +17,6 @@
 #include <netinet/ip.h>
 #include <vector>
 #include <map>
-#include "io_utils.h"
 
 static void die(const char *msg) {
   int err = errno;

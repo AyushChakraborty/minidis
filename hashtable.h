@@ -11,8 +11,8 @@ struct HNode {
 
 //fixed size hashtable
 struct HTab {
-    HNode **tab = NULL; //array of slots in hashtable
-    size_t mask = 0;    //array size is 2^n - 1
+    HNode **tab = NULL; //array of buckets in hashtable
+    size_t mask = 0;    //stores value of 2^n - 1, where 2^n = N is the number of buckets
     size_t size = 0; //number of keys in hashtable
 };
 
@@ -26,5 +26,8 @@ struct HMap {
     //to newer
 };
 
-HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
 void hm_insert(HMap *hmap, HNode *node);
+HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
+HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
+void hm_clear(HMap *hmap);
+size_t hm_size(HMap *hmap);
