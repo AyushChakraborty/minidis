@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,13 +11,19 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <string>
 #include <sys/poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <vector>
-#include <map>
+#include "hashtable.h"
+
+//below macro is to find the ptr to the key within 
+//a struct Entry node
+#define container_of(ptr, T, member) \
+    ((T *)((char *)ptr - offsetof(T, member)))
 
 static void die(const char *msg) {
   int err = errno;
@@ -217,24 +224,90 @@ struct Response {
 };
 
 //kv store
-static std::map<std::string, std::string> store;
+static struct {
+    HMap db;
+} store;
+
+struct Entry {
+    struct HNode node;    //hashtable node
+    std::string key;
+    std::string val;
+};
+
+//eq function for the struct Entry node
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+//needed to store the hash of the key for each node
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i=0; i<len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void do_get(std::vector<std::string> &cmd, Response &out) {
+    //dummy node needed to search, fill the info from cmd 
+    //to this dummy node to then do the search in the hashtable
+    Entry datanode;
+    datanode.key.swap(cmd[1]);
+    datanode.node.hcode = str_hash((uint8_t *)datanode.key.data(), datanode.key.size());
+    
+    HNode *node = hm_lookup(&store.db, &datanode.node, &entry_eq);
+    if (!node) {
+        out.status = RES_NX;
+        return;
+    }
+    
+    //copy the data to out
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= max_msg_size);
+    out.data.assign(val.begin(), val.end());
+}
+
+static void do_set(std::vector<std::string> &cmd, Response &) {
+    //again dummy Entry for lookup
+    Entry datanode;
+    datanode.key.swap(cmd[1]);
+    datanode.node.hcode = str_hash((uint8_t *)datanode.key.data(), datanode.key.size());
+    
+    HNode *node = hm_lookup(&store.db, &datanode.node, &entry_eq);
+    if (node) {
+        //node found, meaning key was already present
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    }else {
+        //not found so allocate and insert a new pair
+        Entry *entry = new Entry();
+        entry->key.swap(datanode.key);
+        entry->node.hcode = datanode.node.hcode;
+        entry->val.swap(cmd[2]);
+        hm_insert(&store.db, &entry->node);
+    }
+}
+
+static void do_del(std::vector<std::string> &cmd, Response &) {
+    Entry datanode;
+    datanode.key.swap(cmd[1]);
+    datanode.node.hcode = str_hash((uint8_t *)datanode.key.data(), datanode.key.size());
+    
+    HNode *node = hm_delete(&store.db, &datanode.node, &entry_eq);
+    if (node) {
+        //deallcate the key value pair then
+        delete container_of(node, Entry, node);
+    }
+}
 
 static void do_request(std::vector<std::string> &cmd, Response &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        auto it = store.find(cmd[1]);
-        if (it == store.end()) {
-            out.status = RES_NX;
-            return;
-        }
-        const std::string &val = it->second;
-        out.data.assign(val.begin(), val.end());
+        return do_get(cmd, out);
     }else if (cmd.size() == 3 && cmd[0] == "set") {
-        store[cmd[1]].swap(cmd[2]);  //swaps ptrs, that way
-        //even if cmd is dropped, which is will be, the ptr
-        //to the value is safe and would be possessed by store[cmd[1]], and 
-        //is guaranteed to not be a dangling ptr   
+        return do_set(cmd, out);
     }else if (cmd.size() == 2 && cmd[0] == "del") {
-        store.erase(cmd[1]);
+        return do_del(cmd, out);
     }else {
         //unrecognised command
         out.status = RES_ERR;
