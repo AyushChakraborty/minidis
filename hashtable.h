@@ -31,3 +31,4 @@ HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
 HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
 void hm_clear(HMap *hmap);
 size_t hm_size(HMap *hmap);
+void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg);

@@ -20,7 +20,7 @@
 #include <vector>
 #include "hashtable.h"
 
-//below macro is to find the ptr to the key within 
+//below macro is to find the ptr to the key within
 //a struct Entry node
 #define container_of(ptr, T, member) \
     ((T *)((char *)ptr - offsetof(T, member)))
@@ -193,7 +193,7 @@ static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::stri
     if (nstr > max_args) {
         return -1;
     }
-    
+
     while (out.size() < nstr) {
         uint32_t len = 0;
         if (!read_u32(data, end, len)) {
@@ -218,10 +218,73 @@ enum {
     RES_NX = 2,    //key not found
 };
 
-struct Response {
-    uint32_t status = 0;
-    std::vector<uint8_t> data;
+//error code for TAG_ERR
+enum {
+    ERR_UNKNOWN = 1,    // unknown command
+    ERR_TOO_BIG = 2,    // response too big
 };
+
+//data types of serialised data
+enum {
+    TAG_NIL = 0,    // nil
+    TAG_ERR = 1,    // error code + msg
+    TAG_STR = 2,    // string
+    TAG_INT = 3,    // int64
+    TAG_DBL = 4,    // double
+    TAG_ARR = 5,    // array
+};
+
+static void buf_append_u8(std::vector<uint8_t> &buf, struct Buffer &status, uint8_t data) {
+    buf_append(&buf, &status, &data, 1);
+}
+
+static void buf_append_u32(std::vector<uint8_t> &buf, struct Buffer &status, uint32_t data) {
+    buf_append(&buf, &status, (const uint8_t *)&data, 4);
+}
+
+static void buf_append_i64(std::vector<uint8_t> &buf, struct Buffer &status, int64_t data) {
+    buf_append(&buf, &status, (const uint8_t *)&data, 8);
+}
+
+//double precision float, takes 8 bytes
+static void buf_append_dbl(std::vector<uint8_t> &buf, struct Buffer &status, double data) {
+    buf_append(&buf, &status, (const uint8_t *)&data, 1);
+}
+
+
+//append serialised data types, serilaised type is of:
+//| tag | len | value |
+static void out_nil(std::vector<uint8_t> &buf, struct Buffer &status) {
+    buf_append_u8(buf, status, TAG_NIL);
+}
+
+static void out_str(std::vector<uint8_t> &buf, struct Buffer &status, const char *str_data, size_t size) {
+    buf_append_u8(buf, status, TAG_STR);   //tag
+    buf_append_u32(buf, status, (uint32_t)size);     //len, allocation of 4B to it
+    buf_append(&buf, &status, (const uint8_t *)str_data, size);   //data, variable allocation based on size
+}
+
+static void out_int(std::vector<uint8_t> &buf, struct Buffer &status, int64_t int_val) {
+    buf_append_u8(buf, status, TAG_INT);
+    buf_append_i64(buf, status, int_val);
+}
+
+static void out_dbl(std::vector<uint8_t> &buf, struct Buffer &status, double dbl_val) {
+    buf_append_u8(buf, status, TAG_DBL);
+    buf_append_dbl(buf, status, dbl_val);
+}
+
+static void out_err(std::vector<uint8_t> &buf, struct Buffer &status, uint32_t code, const std::string &msg) {
+    buf_append_u8(buf, status, TAG_ERR);
+    buf_append_u32(buf, status, code);
+    buf_append_u32(buf, status, (uint32_t)msg.size());
+    buf_append(&buf, &status, (const uint8_t *)msg.data(), msg.size());
+}
+
+static void out_arr(std::vector<uint8_t> &buf, struct Buffer &status, uint32_t n) {
+    buf_append_u8(buf, status, TAG_ARR);
+    buf_append_u32(buf, status, n);
+}
 
 //kv store
 static struct {
@@ -250,31 +313,29 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
     return h;
 }
 
-static void do_get(std::vector<std::string> &cmd, Response &out) {
-    //dummy node needed to search, fill the info from cmd 
+static void do_get(std::vector<std::string> &cmd, std::vector<uint8_t> &buf, struct Buffer &status) {
+    //dummy node needed to search, fill the info from cmd
     //to this dummy node to then do the search in the hashtable
     Entry datanode;
     datanode.key.swap(cmd[1]);
     datanode.node.hcode = str_hash((uint8_t *)datanode.key.data(), datanode.key.size());
-    
+
     HNode *node = hm_lookup(&store.db, &datanode.node, &entry_eq);
     if (!node) {
-        out.status = RES_NX;
-        return;
+        return out_nil(buf, status);
     }
-    
+
     //copy the data to out
     const std::string &val = container_of(node, Entry, node)->val;
-    assert(val.size() <= max_msg_size);
-    out.data.assign(val.begin(), val.end());
+    return out_str(buf, status, val.data(), val.size());
 }
 
-static void do_set(std::vector<std::string> &cmd, Response &) {
+static void do_set(std::vector<std::string> &cmd, std::vector<uint8_t> &buf, struct Buffer &status) {
     //again dummy Entry for lookup
     Entry datanode;
     datanode.key.swap(cmd[1]);
     datanode.node.hcode = str_hash((uint8_t *)datanode.key.data(), datanode.key.size());
-    
+
     HNode *node = hm_lookup(&store.db, &datanode.node, &entry_eq);
     if (node) {
         //node found, meaning key was already present
@@ -287,38 +348,74 @@ static void do_set(std::vector<std::string> &cmd, Response &) {
         entry->val.swap(cmd[2]);
         hm_insert(&store.db, &entry->node);
     }
+    return out_nil(buf, status);
 }
 
-static void do_del(std::vector<std::string> &cmd, Response &) {
+static void do_del(std::vector<std::string> &cmd,std::vector<uint8_t> &buf, struct Buffer &status) {
     Entry datanode;
     datanode.key.swap(cmd[1]);
     datanode.node.hcode = str_hash((uint8_t *)datanode.key.data(), datanode.key.size());
-    
+
     HNode *node = hm_delete(&store.db, &datanode.node, &entry_eq);
     if (node) {
         //deallcate the key value pair then
         delete container_of(node, Entry, node);
     }
+    return out_int(buf, status, node ? 1 : 0);
 }
 
-static void do_request(std::vector<std::string> &cmd, Response &out) {
+struct ScanContext {
+    std::vector<uint8_t> *buf;
+    struct Buffer *status;
+};
+
+static bool cb_keys(HNode *node, void *arg) {
+    ScanContext *ctx = (ScanContext *)arg;
+    const std::string &key = container_of(node, Entry, node)->key;
+    out_str(*ctx->buf, *ctx->status, key.data(), key.size());
+    return true;
+}
+
+static void do_keys(std::vector<std::string> &, std::vector<uint8_t> &buf, struct Buffer &status) {
+    out_arr(buf, status, (uint32_t)hm_size(&store.db));
+    ScanContext ctx = {&buf, &status};
+    hm_foreach(&store.db, &cb_keys, (void*)&ctx);
+}
+
+static void do_request(std::vector<std::string> &cmd, std::vector<uint8_t> &buf, struct Buffer &status) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        return do_get(cmd, out);
+        return do_get(cmd, buf, status);
     }else if (cmd.size() == 3 && cmd[0] == "set") {
-        return do_set(cmd, out);
+        return do_set(cmd, buf, status);
     }else if (cmd.size() == 2 && cmd[0] == "del") {
-        return do_del(cmd, out);
-    }else {
+        return do_del(cmd, buf, status);
+    }else if (cmd.size() == 1 && cmd[0] == "keys") {
+        return do_keys(cmd, buf, status);
+    }
+    else {
         //unrecognised command
-        out.status = RES_ERR;
+        return out_err(buf, status, ERR_UNKNOWN, "unknown command");
     }
 }
 
-static void make_response(const Response &resp, struct Buffer *out_status, std::vector<uint8_t> &out) {
-    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
-    buf_append(&out, out_status, (const uint8_t *)&resp_len, 4);
-    buf_append(&out, out_status, (const uint8_t *)&resp.status, 4);
-    buf_append(&out, out_status, resp.data.data(), resp.data.size());
+static void response_begin(std::vector<uint8_t> &buf, struct Buffer &status, size_t *header) {
+    *header = status.data_end;
+    buf_append_u32(buf, status, 0);
+}
+
+static size_t response_size(struct Buffer &status, size_t header) {
+    return status.data_end - header - 4;
+}
+
+static void response_end(std::vector<uint8_t> &buf, struct Buffer &status, size_t header) {
+    size_t msg_size = response_size(status, header);
+    if (msg_size > max_msg_size) {
+        status.data_end = header + 4; //move the data_end ptr back
+        out_err(buf, status, ERR_TOO_BIG, "response is too big");
+        msg_size = response_size(status, header);
+    }
+    uint32_t len = (uint32_t)msg_size;
+    memcpy(&buf[header], &len, 4); //write the header at the front
 }
 
 static bool try_one_request(Conn *conn) {
@@ -343,18 +440,19 @@ static bool try_one_request(Conn *conn) {
 
     const uint8_t *req = &conn->incoming[4];
 
-   //application logic here
-   std::vector<std::string> cmd;
-   if (parse_req(req, len, cmd) < 0) {
-       msg("bad request");
-       conn->want_close = true;
-       return false;
-   }
-   
-   Response resp;
-   do_request(cmd, resp);
-   make_response(resp, &conn->outgoing_status, conn->outgoing);
-   
+    //application logic here
+    std::vector<std::string> cmd;
+    if (parse_req(req, len, cmd) < 0) {
+        msg("bad request");
+        conn->want_close = true;
+        return false;
+    }
+
+    // Response resp;
+    size_t header_pos = 0;
+    response_begin(conn->outgoing, conn->outgoing_status, &header_pos);
+    do_request(cmd, conn->outgoing, conn->outgoing_status);
+    response_end(conn->outgoing, conn->outgoing_status, header_pos);
 
     //remove the req message
     buf_consume(&conn->incoming_status, 4 + len);
@@ -392,7 +490,7 @@ static void handle_read(Conn *conn) {
 
     //parse reqs and generate responses
     while (try_one_request(conn)) {}     //in a while loop to handle pipelined reqs from client
-    
+
     size_t curr_outgoing_len = conn->outgoing_status.data_end - conn->outgoing_status.data_begin;
 
     //update readiness intention
